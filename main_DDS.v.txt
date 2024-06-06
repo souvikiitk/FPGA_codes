@@ -1,0 +1,211 @@
+module DDS_main (
+    input wire clk,           // System clock
+    input wire reset,         // System reset
+    input wire [31:0] freq,   // Desired frequency tuning word
+    output reg W_CLK,         // AD9850 W_CLK pin
+    output reg FQ_UD,         // AD9850 FQ_UD pin
+    output reg [7:0] DATA,    // AD9850 DATA pins
+    output reg RESET          // AD9850 RESET pin
+);
+
+    // Parameters
+    localparam REF_CLK = 125000000; // Reference clock frequency (125 MHz)
+    localparam TUNING_WORD_WIDTH = 32;
+
+    // Calculate frequency tuning word
+    reg [TUNING_WORD_WIDTH-1:0] tuning_word;
+    always @(posedge clk or posedge reset) begin
+        if (reset) begin
+            tuning_word <= 0;
+        end else begin
+            //tuning_word <= (freq * 32'hFFFFFFFF) / REF_CLK; // Calculate tuning word
+				tuning_word <= 32'b101111111111110111111111111010111;
+        end
+    end
+
+    // FSM state definitions
+    typedef enum logic [2:0] {
+        IDLE = 3'b000,
+        RESET_PULSE = 3'b001,
+        SEND_TW0 = 3'b010,
+        SEND_TW1 = 3'b011,
+        SEND_TW2 = 3'b100,
+        SEND_TW3 = 3'b101,
+        SEND_CTRL_BYTE = 3'b110,
+        UPDATE_FREQ = 3'b111
+    } state_t;
+
+    state_t state, next_state;
+
+    // Chunk counter for parallel communication
+    reg [2:0] chunk_count;
+
+    // Flag to control frequency update process
+    reg update_in_progress;
+
+    // Clock divider to slow down the clock for AD9850 (optional)
+    reg [7:0] clk_div;
+    wire slow_clk = clk_div[7];
+
+    always @(posedge clk or posedge reset) begin
+        if (reset) begin
+            clk_div <= 8'd0;
+        end else begin
+            clk_div <= clk_div + 1;
+        end
+    end
+
+    // FSM: State transitions
+    always @(posedge slow_clk or posedge reset) begin
+        if (reset) begin
+            state <= IDLE;
+        end else if(!update_in_progress) begin
+            state <= next_state;
+        end
+    end
+
+    // FSM: Next state logic
+    always @(*) begin
+        next_state = state; // Default to current state
+        case (state)
+            IDLE: if (!update_in_progress) next_state = RESET_PULSE;
+            RESET_PULSE: next_state = SEND_TW0;
+            SEND_TW0: next_state = SEND_TW1;
+            SEND_TW1: next_state = SEND_TW2;
+            SEND_TW2: next_state = SEND_TW3;
+            SEND_TW3: next_state = SEND_CTRL_BYTE;
+            SEND_CTRL_BYTE: next_state = UPDATE_FREQ;
+            UPDATE_FREQ: next_state = IDLE;
+            default: next_state = IDLE;
+        endcase
+    end
+
+    // FSM: Output logic
+    always @(posedge slow_clk or posedge reset) begin
+        if (reset) begin
+            W_CLK <= 1'b0;
+            FQ_UD <= 1'b0;
+            DATA <= 8'b0;
+            RESET <= 1'b0; // Active high reset
+            chunk_count <= 3'd0;
+            update_in_progress <= 1'b0;
+        end else begin
+            case (state)
+                IDLE: begin
+                    RESET <= 1'b0;
+                    chunk_count <= 3'd0;
+                    W_CLK <= 1'b0;
+                    FQ_UD <= 1'b0;
+                    //update_in_progress <= 1'b1;
+                end
+                RESET_PULSE: begin
+                    RESET <= 1'b1;
+                    chunk_count <= 3'd0; // Reset chunk counter
+                    W_CLK <= 1'b0;
+                end
+                SEND_TW0: begin
+                    RESET <= 1'b0;
+                    DATA <= tuning_word[7:0]; // Send first 8 bits of tuning word
+                    W_CLK <= ~W_CLK; // Toggle W_CLK
+                    chunk_count <= chunk_count + 1; // Increment chunk counter on W_CLK rising edge
+                end
+                SEND_TW1: begin
+                    DATA <= tuning_word[15:8]; // Send second 8 bits of tuning word
+                    W_CLK <= ~W_CLK; // Toggle W_CLK
+                    chunk_count <= chunk_count + 1; // Increment chunk counter on W_CLK rising edge
+                end
+                SEND_TW2: begin
+                    DATA <= tuning_word[23:16]; // Send third 8 bits of tuning word
+                    W_CLK <= ~W_CLK; // Toggle W_CLK
+                    chunk_count <= chunk_count + 1; // Increment chunk counter on W_CLK rising edge
+                end
+                SEND_TW3: begin
+                    DATA <= tuning_word[31:24]; // Send fourth 8 bits of tuning word
+                    W_CLK <= ~W_CLK; // Toggle W_CLK
+                    chunk_count <= chunk_count + 1; // Increment chunk counter on W_CLK rising edge
+                end
+                SEND_CTRL_BYTE: begin
+                    //DATA <= 8'b0; // Send control byte (usually 0x00)
+                    W_CLK <= ~W_CLK; // Toggle W_CLK
+                    //chunk_count <= chunk_count + 1; // Increment chunk counter on W_CLK rising edge
+                end
+                UPDATE_FREQ: begin
+                    FQ_UD <= 1'b1; // Pulse FQ_UD to update frequency
+                    W_CLK <= 1'b0;
+                    update_in_progress <= 1'b1; // Clear update_in_progress flag to stop further updates
+                end
+            endcase
+        end
+    end
+
+endmodule
+
+
+
+
+
+module DDS_main_tb;
+
+    // Testbench signals
+    reg clk;
+    reg reset;
+    reg [31:0] freq;
+    wire W_CLK;
+    wire FQ_UD;
+    wire [7:0] DATA;
+    wire RESET;
+
+    // Instantiate the module under test (MUT)
+    DDS_main uut (
+        .clk(clk),
+        .reset(reset),
+        .freq(freq),
+        .W_CLK(W_CLK),
+        .FQ_UD(FQ_UD),
+        .DATA(DATA),
+        .RESET(RESET)
+    );
+
+    // Clock generation
+    always #5 clk = ~clk; // 100MHz clock
+
+    initial begin
+        // Initialize signals
+        clk = 0;
+        reset = 1;
+        freq = 32'd0;
+
+        // Reset the system
+        #20;
+        reset = 0;
+        #20;
+        reset = 1;
+        #20;
+        reset = 0;
+
+        // Apply a frequency
+        freq = 32'd5000000; // 5 MHz
+        #200000; // Wait for some time
+
+        // Apply another frequency
+        //freq = 32'd10000000; // 10 MHz
+        //#20000; // Wait for some time
+
+        // Apply another frequency
+        //freq = 32'd20000000; // 20 MHz
+        //#20000; // Wait for some time
+
+        // Finish the simulation
+        $finish;
+    end
+
+    // Monitor signals
+    initial begin
+        $monitor("Time = %0t, state = %0d, chunk_count = %0d, W_CLK = %b, FQ_UD = %b, DATA = %b, RESET = %b", 
+                 $time, uut.state, uut.chunk_count, W_CLK, FQ_UD, DATA, RESET);
+    end
+
+    // Dump waveform
+
+endmodule
+
